@@ -1,0 +1,169 @@
+---
+title: "Study of the U.S. CPI"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+library("here")
+library("lubridate")
+library("tidyr")
+library("dplyr")
+library("data.table")
+library("zoo")
+library("ggplot2")
+library("tseries")
+library("forecast")
+library("rlang")
+```
+
+Primeiro, vamos importar todos os indices de inflação dos países relevantes para este estudo. Além disso, vamos realizar as devidas padronizaçoes nas datas e valores.
+
+Nossa primeira tarefa é destacar os períodos inflacioários de cada um dos países. Para isso, adicionaremos uma variável dummy onde o valor 1 indica que o período pode ser classificado como inflacionário, e 0 caso contrário.
+
+Seguindo Neville et al. (2022), definimos um período inflacionário da seguinte forma:
+
+> 1) O início do périodo inflacionário é definido quando o Headline CPI YoY >= 5%;
+> 2) O fim do período inflacionário é definido quando o Headline CPI YoY atinge um pico sem que tenha caida 50% da sua taxa anual nos últimos 24 meses.
+
+```{r}
+CPI_YOY_THRESHOLD <- list(bz=8, eu=2, us=5)
+ROLL_MAXDD_THRESHOLD <- 0.5
+tags <- c("us", "eu", "bz")
+
+cpis = list()
+cpis_qoq = list()
+cpis_yoy = list()
+for (tag in tags){
+  tmp_cpi <- read.csv(here("src", "data", paste0(tag, "_cpi_components.csv")), sep="") %>% as.data.table()
+  
+  dates <- ymd(tmp_cpi$Index)
+  tmp_cpi <- tmp_cpi %>% select(-Index) %>% mutate(across(where(is.character), function(x) as.numeric(x))) %>%
+    mutate(date=dates) %>% select(date, everything())
+  
+  tmp_cpi_ts <- zoo(x = tmp_cpi %>% select(-date), order.by = tmp_cpi$date)
+  yoy_tmp_cpi_ts <- ((tmp_cpi_ts / stats::lag(x = tmp_cpi_ts, k = -12)) - 1) * 100
+  mom_tmp_cpi_ts <- ((tmp_cpi_ts / stats::lag(x = tmp_cpi_ts, k = -3)) - 1) * 100
+  
+  core_name <- colnames(tmp_cpi)[grep("CPI$", colnames(tmp_cpi))[1]]
+  cpi_core_roll_maxdd <- (yoy_tmp_cpi_ts[, core_name] / rollmax(x = yoy_tmp_cpi_ts[, core_name], k = 24, align = 'right'))-1
+  yoy_tmp_cpi_ts <- merge(yoy_tmp_cpi_ts,
+                          CPI_ROLL_MAXDD=cpi_core_roll_maxdd)
+  cpi_regime_indicator <- ifelse((yoy_tmp_cpi_ts[, core_name] >= CPI_YOY_THRESHOLD[[tag]])&
+                                 (yoy_tmp_cpi_ts[, "CPI_ROLL_MAXDD"] >= -ROLL_MAXDD_THRESHOLD),
+                                 1,
+                                 0)
+
+  tmp_cpi_ts <- merge(tmp_cpi_ts, CPI_REGIME=cpi_regime_indicator)
+  yoy_tmp_cpi_ts <- merge(yoy_tmp_cpi_ts, CPI_REGIME=cpi_regime_indicator)
+  mom_tmp_cpi_ts <- merge(mom_tmp_cpi_ts, CPI_REGIME=cpi_regime_indicator)
+    
+  cpis[[tag]] <- tmp_cpi
+  cpis_yoy[[tag]] <- yoy_tmp_cpi_ts
+  cpis_qoq[[tag]] <- mom_tmp_cpi_ts
+
+}
+
+bz_cpi = cpis$bz
+eu_cpi = cpis$eu
+us_cpi = cpis$us
+
+bz_cpi_yoy = cpis_yoy$bz
+eu_cpi_yoy = cpis_yoy$eu
+us_cpi_yoy = cpis_yoy$us
+
+bz_cpi_qoq = cpis_qoq$bz
+eu_cpi_qoq = cpis_qoq$eu
+us_cpi_qoq = cpis_qoq$us
+
+tail(us_cpi)
+tail(eu_cpi)
+tail(bz_cpi)
+
+autoplot(us_cpi_yoy[,c("US_CPI", "CPI_REGIME")], facets = NULL)
+autoplot(eu_cpi_yoy[,c("EU_CPI", "CPI_REGIME")], facets = NULL)
+autoplot(bz_cpi_yoy[,c("BZ_CPI", "CPI_REGIME")], facets = NULL)
+
+```
+
+Uma vez com os dados em mãos, gostariamos de responder as seguintes perguntas:
+
+> 1) Quão persistente é a inflação nos países considerados? 
+> 2) Quais componentes do próprio CPI são os principais "drivers" dos ciclos inflacionários?
+> 3) Quais componentes exógenos (petróleo, estimulo fiscal/monetário, câmbio, etc) são os principais "drivers"dos ciclos inflacionários?
+> 4) Como os ciclos inflacionários do EUA se comparam com os ciclos brasileiros?
+
+
+Começaremos com a primeira pergunta. Para isso, estimaremos um modelo AR(p) para cada uma das inflações YoY. Entretanto, antes de estimarmos os modelos, testaremos estacionariedade das séries para garantir que nenhuma tranformação adicional dos dados é necessária.
+
+## Quão persistente é a inflação nos países considerados?  ##
+### Teste de estacionariedade
+
+```{r}
+yoy_test <- list()
+for (tag in tags){
+  target_name <- colnames(cpis_yoy[[tag]])[grep(paste0("CORE", "$"), colnames(cpis_yoy[[tag]]))[1]]
+  
+  yoy_st <- adf.test(cpis_yoy[[tag]][,target_name] %>% as.data.table() %>% drop_na() %>% as.ts())
+  pval <- yoy_st$p.value
+  yoy_test[[tag]] <- pval
+}
+adf_test_df <- do.call("rbind", yoy_test) 
+adf_test_df
+```
+
+### Modelo AR(p) - YoY
+
+```{r}
+yoy_models <- list()
+for (tag in tags){
+  target_name <- colnames(cpis_yoy[[tag]])[grep(paste0("CORE", "$"), colnames(cpis_yoy[[tag]]))[1]]
+  
+  tmp_ar <- auto.arima(cpis_yoy[[tag]][,target_name] %>% as.data.table() %>% drop_na() %>% as.ts(),
+                       max.p = 12,
+                       max.q = 0,
+                       max.d = 1)
+  yoy_models[[tag]] <- tmp_ar
+}
+yoy_models
+```
+
+## Quais componentes do próprio CPI são os principais "drivers" dos ciclos inflacionários?  ##
+### Inflação YoY média dentro nos ciclos inflacionários e para cada componente
+
+```{r}
+tmp_summary <- us_cpi_yoy %>% as.data.table(keep.rownames = TRUE) %>% select(-CPI_CORE_ROLL_MAXDD) %>%
+  filter(CPI_REGIME == 1) %>% rename(date = rn) %>% mutate(date = ymd(date)) %>%
+  mutate(year = year(date)) %>% select(-date, -CPI_REGIME, -US_CPI, -US_CPI_CORE) %>% group_by(year) %>%
+  dplyr::summarize(across(everything(), list(mean))) %>% ungroup()
+melt_tmp_summary = melt(data = tmp_summary, id.vars = "year")
+
+ggplot(melt_tmp_summary, aes(x = year, y = value, colour = variable, group = variable)) + geom_line()
+```
+### Modelo AR(p) para estimar a persistência dos componentes
+
+```{r}
+components_models <- list()
+tag <- "us"
+delete_col_names <- c("US_CPI", "US_CPI_CORE", "CPI_CORE_ROLL_MAXDD", "CPI_REGIME")
+for (colname in colnames(cpis_yoy[[tag]])){
+  if (colname %in% delete_col_names){
+    next
+  }
+  else{
+    tmp_ar <- auto.arima(cpis_yoy[[tag]][,colname] %>% as.data.table() %>% drop_na() %>% as.ts(),
+                     max.p = 12,
+                     max.q = 0,
+                     max.d = 1)
+    components_models[[colname]] <- tmp_ar 
+  }
+}
+components_models
+```
+
+## Quais componentes exógenos (petróleo, estimulo fiscal/monetário, câmbio, etc) são os principais "drivers"dos ciclos inflacionários? ##
+
+```{r}
+
+```
+

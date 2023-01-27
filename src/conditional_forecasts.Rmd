@@ -1,0 +1,59 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+library("vars")
+library("dplyr")
+library("tidyr")
+library("data.table")
+```
+
+```{r}
+data("Canada")
+
+p <- 2
+h <- 12
+shock_pct <- 0.01
+endog_names <- c("e", "rw")
+exog_names <- c("prod")
+
+# select exog and expand
+exog <- Canada %>% as.data.table() %>% dplyr::select(contains(exog_names))
+for (exogn in exog_names){
+  for (i in 1:p){
+    exog <- exog %>% mutate(!!paste0(exogn, ".l", as.character(i)) := dplyr::lag(x = !!sym(exogn), n = i))
+  } 
+}
+exog <- exog %>% drop_na()
+
+# select endog
+endog <- Canada %>% as.data.table() %>%dplyr::select(contains(endog_names)) %>% slice(p+1:n())
+
+# select train data
+train_endog <- endog %>% slice(1:(n() - h))
+train_exog <- exog %>% slice(1:(n() - h))
+var_fit <- VAR(y = train_endog, type = c("none"), p = p, exogen = train_exog)
+
+# select test data
+test_exog <- exog %>% slice((n() - h + 1):n())
+test_exog_fixed <- t(matrix(rep(t(exog %>% slice(n() - h + 1)), h), ncol = h)) %>% as.data.table()
+colnames(test_exog_fixed) <- colnames(exog)
+test_exog_fixed <- test_exog_fixed - (test_exog_fixed * shock_pct) 
+
+var_forecasts1 <- predict(object = var_fit, n.ahead = nrow(test_exog), dumvar = test_exog)
+var_forecasts2 <- predict(object = var_fit, n.ahead = nrow(exog_test), dumvar = test_exog_fixed)
+
+plot(var_forecasts1)
+plot(var_forecasts2)
+```
+
+
+
+
+
+
+
+
